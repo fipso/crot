@@ -8,6 +8,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <cjson/cJSON.h>
 
 #define WIDTH 1080
 #define HEIGHT 1920
@@ -47,7 +48,7 @@ typedef struct {
     int wordCount;
 } Caption;
 
-// JSON parser for caption files
+// JSON parser for caption files using cJSON
 int loadCaptions(const char* projectId, Caption* captions, int maxCaptions) {
     char dirPath[256];
     snprintf(dirPath, sizeof(dirPath), "media/captions/%s", projectId);
@@ -91,7 +92,10 @@ int loadCaptions(const char* projectId, Caption* captions, int maxCaptions) {
         snprintf(filePath, sizeof(filePath), "%s/%s", dirPath, entries[fileIdx]->d_name);
         
         FILE* file = fopen(filePath, "r");
-        if (!file) continue;
+        if (!file) {
+            free(entries[fileIdx]);
+            continue;
+        }
         
         // Read entire file
         fseek(file, 0, SEEK_END);
@@ -103,88 +107,78 @@ int loadCaptions(const char* projectId, Caption* captions, int maxCaptions) {
         jsonContent[fileSize] = '\0';
         fclose(file);
         
-        // Extract transcript
-        char* transcriptStart = strstr(jsonContent, "\"transcript\": \"");
-        if (transcriptStart) {
-            transcriptStart += 15; // Skip "transcript": "
-            char* transcriptEnd = strstr(transcriptStart, "\",");
-            if (transcriptEnd) {
-                int transcriptLen = transcriptEnd - transcriptStart;
-                if (transcriptLen < MAX_TEXT_LENGTH - 1) {
-                    strncpy(captions[captionCount].text, transcriptStart, transcriptLen);
-                    captions[captionCount].text[transcriptLen] = '\0';
-                    
-                    // Determine speaker from filename
-                    if (strstr(entries[fileIdx]->d_name, "peter")) {
-                        captions[captionCount].speaker = PETER;
-                    } else if (strstr(entries[fileIdx]->d_name, "stewie")) {
-                        captions[captionCount].speaker = STEWIE;
-                    }
-                    
-                    // Parse word timing data
-                    captions[captionCount].wordCount = 0;
-                    char* wordsStart = strstr(jsonContent, "\"words\": [");
-                    if (wordsStart) {
-                        char* wordPtr = wordsStart;
-                        int wordIdx = 0;
-                        
-                        while ((wordPtr = strstr(wordPtr, "\"word\": \"")) != NULL && wordIdx < 100) {
-                            wordPtr += 9; // Skip "word": "
-                            char* wordEnd = strstr(wordPtr, "\"");
-                            if (wordEnd) {
-                                int wordLen = wordEnd - wordPtr;
-                                if (wordLen < 63) {
-                                    strncpy(captions[captionCount].words[wordIdx].word, wordPtr, wordLen);
-                                    captions[captionCount].words[wordIdx].word[wordLen] = '\0';
-                                    
-                                    // Find start and end times for this word
-                                    char* startPtr = strstr(wordEnd, "\"start\": ");
-                                    char* endPtr = strstr(wordEnd, "\"end\": ");
-                                    if (startPtr && endPtr) {
-                                        startPtr += 9;
-                                        endPtr += 7;
-                                        // Add time offset to sequence the conversations
-                                        captions[captionCount].words[wordIdx].start = atof(startPtr) + currentTimeOffset;
-                                        captions[captionCount].words[wordIdx].end = atof(endPtr) + currentTimeOffset;
-                                        wordIdx++;
-                                    }
-                                }
-                            }
-                            wordPtr = wordEnd;
-                        }
-                        captions[captionCount].wordCount = wordIdx;
-                    }
-                    
-                    // Set overall timing based on first and last word
-                    if (captions[captionCount].wordCount > 0) {
-                        captions[captionCount].startTime = captions[captionCount].words[0].start;
-                        captions[captionCount].endTime = captions[captionCount].words[captions[captionCount].wordCount - 1].end;
-                        
-                        // Update time offset for next file (add 0.5 second gap)
-                        currentTimeOffset = captions[captionCount].endTime + 0.5f;
-                    } else {
-                        // Fallback timing
-                        captions[captionCount].startTime = currentTimeOffset;
-                        captions[captionCount].endTime = currentTimeOffset + 3.0f;
-                        currentTimeOffset += 3.5f;
-                    }
-                    
-                    captionCount++;
-                }
-            }
+        // Parse JSON
+        cJSON* json = cJSON_Parse(jsonContent);
+        if (!json) {
+            printf("Error parsing JSON in file: %s\n", entries[fileIdx]->d_name);
+            free(jsonContent);
+            free(entries[fileIdx]);
+            continue;
         }
         
+        // Extract transcript
+        cJSON* transcript = cJSON_GetObjectItem(json, "transcript");
+        if (cJSON_IsString(transcript)) {
+            strncpy(captions[captionCount].text, transcript->valuestring, MAX_TEXT_LENGTH - 1);
+            captions[captionCount].text[MAX_TEXT_LENGTH - 1] = '\0';
+            
+            // Determine speaker from filename
+            if (strstr(entries[fileIdx]->d_name, "peter")) {
+                captions[captionCount].speaker = PETER;
+            } else if (strstr(entries[fileIdx]->d_name, "stewie")) {
+                captions[captionCount].speaker = STEWIE;
+            }
+            
+            // Parse word timing data
+            captions[captionCount].wordCount = 0;
+            cJSON* words = cJSON_GetObjectItem(json, "words");
+            if (cJSON_IsArray(words)) {
+                int wordIdx = 0;
+                cJSON* word = NULL;
+                
+                cJSON_ArrayForEach(word, words) {
+                    if (wordIdx >= 100) break;
+                    
+                    cJSON* wordText = cJSON_GetObjectItem(word, "word");
+                    cJSON* startTime = cJSON_GetObjectItem(word, "start");
+                    cJSON* endTime = cJSON_GetObjectItem(word, "end");
+                    
+                    if (cJSON_IsString(wordText) && cJSON_IsNumber(startTime) && cJSON_IsNumber(endTime)) {
+                        strncpy(captions[captionCount].words[wordIdx].word, wordText->valuestring, 63);
+                        captions[captionCount].words[wordIdx].word[63] = '\0';
+                        
+                        // Add time offset to sequence the conversations
+                        captions[captionCount].words[wordIdx].start = startTime->valuedouble + currentTimeOffset;
+                        captions[captionCount].words[wordIdx].end = endTime->valuedouble + currentTimeOffset;
+                        wordIdx++;
+                    }
+                }
+                captions[captionCount].wordCount = wordIdx;
+            }
+            
+            // Set overall timing based on first and last word
+            if (captions[captionCount].wordCount > 0) {
+                captions[captionCount].startTime = captions[captionCount].words[0].start;
+                captions[captionCount].endTime = captions[captionCount].words[captions[captionCount].wordCount - 1].end;
+                
+                // Update time offset for next file (add 0.5 second gap)
+                currentTimeOffset = captions[captionCount].endTime + 0.5f;
+            } else {
+                // Fallback timing
+                captions[captionCount].startTime = currentTimeOffset;
+                captions[captionCount].endTime = currentTimeOffset + 3.0f;
+                currentTimeOffset += 3.5f;
+            }
+            
+            captionCount++;
+        }
+        
+        cJSON_Delete(json);
         free(jsonContent);
         free(entries[fileIdx]);
     }
     
     printf("Loaded %d captions from %s (total duration: %.1fs)\n", captionCount, dirPath, currentTimeOffset);
-    
-    // Return the total duration as a special value in the last caption's endTime
-    if (captionCount > 0) {
-        // Store total duration for later use
-        captions[captionCount - 1].endTime = currentTimeOffset - 0.5f; // Remove the last gap
-    }
     
     return captionCount;
 }
