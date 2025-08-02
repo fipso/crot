@@ -421,10 +421,20 @@ int getBackgroundFrame(BackgroundVideo *bg, double target_time,
 
   // Only seek when we have a significant time jump
   static int64_t last_pts = -1;
-  if (last_pts == -1 ||
-      abs((int)(target_pts - last_pts)) > 30) { // 30 frame tolerance
-    if (av_seek_frame(bg->fmt_ctx, bg->stream_index, target_pts,
-                      AVSEEK_FLAG_BACKWARD) >= 0) {
+  static double last_frame_time = -1.0;
+
+  // Clear the buffer to black first
+  memset(rgba_buffer, 0, WIDTH * HEIGHT * 4);
+
+  // Calculate target PTS for seeking
+  if (bg->start_time != AV_NOPTS_VALUE) {
+    target_pts += bg->start_time;
+  }
+
+  // Seek if first time or significant jump or going backwards
+  if (last_pts == -1 || target_pts < last_pts || llabs(target_pts - last_pts) > (int64_t)(0.5 / bg->time_base)) {
+    int seek_flags = AVSEEK_FLAG_BACKWARD;
+    if (av_seek_frame(bg->fmt_ctx, bg->stream_index, target_pts, seek_flags) >= 0) {
       avcodec_flush_buffers(bg->codec_ctx);
     }
     last_pts = target_pts;
@@ -442,8 +452,12 @@ int getBackgroundFrame(BackgroundVideo *bg, double target_time,
 
           double frame_time = frame_pts * bg->time_base;
 
-          // Use frame if it's reasonably close to target time
-          if (fabs(frame_time - target_time) < 0.5) {
+          // Skip if frame is before last frame time (prevent jumping back)
+          if (frame_time < last_frame_time) continue;
+
+          // Use frame if it's the closest before or at target
+          if (frame_time <= target_time + 0.02) {
+            last_frame_time = frame_time;
             // Calculate scaled dimensions
             int src_width = bg->codec_ctx->width;
             int src_height = bg->codec_ctx->height;
