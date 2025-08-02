@@ -3,8 +3,8 @@
 
 # Compiler and base flags
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -O2 $(shell pkg-config --cflags raylib libavcodec libavformat libavutil libswscale libcjson)
-LDFLAGS = $(shell pkg-config --libs raylib libavcodec libavformat libavutil libswscale libcjson) -lm -lpthread -ldl
+CFLAGS = -Wall -Wextra -std=c11 -O2 $(shell pkg-config --cflags raylib libavcodec libavformat libavutil libswscale libswresample libcjson)
+LDFLAGS = $(shell pkg-config --libs raylib libavcodec libavformat libavutil libswscale libswresample libcjson) -lm -lpthread -ldl
 
 # Source files (expand as you add more)
 SRCS = main.c
