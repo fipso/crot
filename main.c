@@ -8,13 +8,17 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vaapi.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 #include <math.h>
 #include <raylib.h>
+#include <rlgl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 
 #define WIDTH 1080
 #define HEIGHT 1920
@@ -23,6 +27,20 @@
 #define CHARACTER_SCALE 0.5f
 #define MAX_CAPTIONS 1000
 #define MAX_TEXT_LENGTH 512
+
+// Timing utilities for performance debugging
+static double get_time_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
+}
+
+#define TIMING_START(name) \
+    double timing_start_##name = get_time_ms()
+
+#define TIMING_END(name) \
+    double timing_end_##name = get_time_ms(); \
+    printf("[TIMING] %s: %.2fms\n", #name, timing_end_##name - timing_start_##name)
 
 typedef enum { PETER, STEWIE } Character;
 
@@ -199,13 +217,14 @@ int loadCaptions(const char *projectId, Caption *captions, int maxCaptions) {
   return captionCount;
 }
 
-// Background video decoder context
+// Background video decoder context for on-demand loading
 typedef struct {
   AVFormatContext *fmt_ctx;
   AVCodecContext *codec_ctx;
   AVStream *video_stream;
   struct SwsContext *sws_ctx;
   AVFrame *frame;
+  AVFrame *sw_frame;  // Software frame for CPU access
   AVPacket *pkt;
   int stream_index;
   double time_base;
@@ -232,14 +251,12 @@ typedef struct {
   int buffer_samples;   // Total samples in buffer
 } AudioFile;
 
-// Initialize background video decoder with AMD hardware acceleration
+// Forward declarations
+int getBackgroundFrame(BackgroundVideo *bg, double target_time, uint8_t *rgba_buffer);
+
+// Initialize background video decoder
 int initBackgroundVideo(BackgroundVideo *bg, const char *filename) {
-  bg->fmt_ctx = NULL;
-  bg->codec_ctx = NULL;
-  bg->video_stream = NULL;
-  bg->sws_ctx = NULL;
-  bg->frame = NULL;
-  bg->pkt = NULL;
+  memset(bg, 0, sizeof(BackgroundVideo));
   bg->stream_index = -1;
 
   // Open video file
@@ -267,49 +284,14 @@ int initBackgroundVideo(BackgroundVideo *bg, const char *filename) {
     return -1;
   }
 
-  // Try AMD hardware decoders first, then fallback to software
-  const AVCodec *codec = NULL;
-  const char *hw_decoder_names[] = {"h264_vaapi", // AMD VAAPI H.264 decoder
-                                    "hevc_vaapi", // AMD VAAPI HEVC decoder
-                                    "h264_amf",   // AMD AMF H.264 decoder
-                                    "hevc_amf",   // AMD AMF HEVC decoder
-                                    NULL};
-
-  // First try hardware decoders based on codec type
-  if (bg->video_stream->codecpar->codec_id == AV_CODEC_ID_H264) {
-    for (int i = 0; hw_decoder_names[i]; i++) {
-      if (strstr(hw_decoder_names[i], "h264")) {
-        codec = avcodec_find_decoder_by_name(hw_decoder_names[i]);
-        if (codec) {
-          printf("Using AMD hardware decoder: %s\n", hw_decoder_names[i]);
-          break;
-        }
-      }
-    }
-  } else if (bg->video_stream->codecpar->codec_id == AV_CODEC_ID_HEVC) {
-    for (int i = 0; hw_decoder_names[i]; i++) {
-      if (strstr(hw_decoder_names[i], "hevc")) {
-        codec = avcodec_find_decoder_by_name(hw_decoder_names[i]);
-        if (codec) {
-          printf("Using AMD hardware decoder: %s\n", hw_decoder_names[i]);
-          break;
-        }
-      }
-    }
-  }
-
-  // Fallback to software decoder
+  // Find H.264 decoder with hardware acceleration support
+  const AVCodec *codec = avcodec_find_decoder(bg->video_stream->codecpar->codec_id);
   if (!codec) {
-    codec = avcodec_find_decoder(bg->video_stream->codecpar->codec_id);
-    if (codec) {
-      printf("Using software decoder: %s\n", codec->name);
-    }
-  }
-
-  if (!codec) {
-    printf("Error: Unsupported codec\n");
+    printf("Error: Could not find decoder for codec\n");
     return -1;
   }
+  
+  printf("Found decoder: %s\n", codec->name);
 
   // Allocate codec context
   bg->codec_ctx = avcodec_alloc_context3(codec);
@@ -319,82 +301,62 @@ int initBackgroundVideo(BackgroundVideo *bg, const char *filename) {
   }
 
   // Copy codec parameters
-  if (avcodec_parameters_to_context(bg->codec_ctx, bg->video_stream->codecpar) <
-      0) {
+  if (avcodec_parameters_to_context(bg->codec_ctx, bg->video_stream->codecpar) < 0) {
     printf("Error: Could not copy codec parameters\n");
     return -1;
   }
 
-  // Set hardware acceleration options for VAAPI
-  if (strstr(codec->name, "vaapi")) {
-    AVDictionary *opts = NULL;
-    av_dict_set(&opts, "hwaccel", "vaapi", 0);
-    av_dict_set(&opts, "hwaccel_device", "/dev/dri/renderD128", 0);
+  // Try VAAPI hardware acceleration first
+  AVDictionary *opts = NULL;
+  av_dict_set(&opts, "hwaccel", "vaapi", 0);
+  av_dict_set(&opts, "hwaccel_device", "/dev/dri/renderD128", 0);
 
-    if (avcodec_open2(bg->codec_ctx, codec, &opts) < 0) {
-      printf("Warning: Could not open hardware decoder, trying software "
-             "fallback\n");
-      av_dict_free(&opts);
-      avcodec_free_context(&bg->codec_ctx);
-
-      // Fallback to software decoder
-      codec = avcodec_find_decoder(bg->video_stream->codecpar->codec_id);
-      if (!codec) {
-        printf("Error: Could not find software decoder\n");
-        return -1;
-      }
-      bg->codec_ctx = avcodec_alloc_context3(codec);
-      avcodec_parameters_to_context(bg->codec_ctx, bg->video_stream->codecpar);
-      if (avcodec_open2(bg->codec_ctx, codec, NULL) < 0) {
-        printf("Error: Could not open software decoder\n");
-        return -1;
-      }
-      printf("Using software decoder fallback: %s\n", codec->name);
-    } else {
-      printf("Successfully initialized AMD VAAPI hardware decoder\n");
-    }
-    av_dict_free(&opts);
+  if (avcodec_open2(bg->codec_ctx, codec, &opts) >= 0) {
+    printf("Successfully initialized VAAPI hardware acceleration\n");
   } else {
-    // Open codec normally
-    if (avcodec_open2(bg->codec_ctx, codec, NULL) < 0) {
-      printf("Error: Could not open codec\n");
+    printf("Warning: VAAPI failed, trying software decoder\n");
+    av_dict_free(&opts);
+    avcodec_free_context(&bg->codec_ctx);
+
+    // Fallback to software decoder
+    bg->codec_ctx = avcodec_alloc_context3(codec);
+    if (!bg->codec_ctx || 
+        avcodec_parameters_to_context(bg->codec_ctx, bg->video_stream->codecpar) < 0 ||
+        avcodec_open2(bg->codec_ctx, codec, NULL) < 0) {
+      printf("Error: Could not initialize decoder\n");
       return -1;
     }
+    printf("Using software decoder\n");
   }
+  av_dict_free(&opts);
 
-  // Allocate frame and packet
+  // Allocate frames and packet
   bg->frame = av_frame_alloc();
+  bg->sw_frame = av_frame_alloc();
   bg->pkt = av_packet_alloc();
 
-  if (!bg->frame || !bg->pkt) {
-    printf("Error: Could not allocate frame or packet\n");
+  if (!bg->frame || !bg->sw_frame || !bg->pkt) {
+    printf("Error: Could not allocate frames or packet\n");
     return -1;
   }
 
-  // Calculate proper scaling dimensions to fit 9:16 aspect ratio
+  // Verify video dimensions (should be pre-scaled to 1080x1920)
   int src_width = bg->codec_ctx->width;
   int src_height = bg->codec_ctx->height;
-  float src_aspect = (float)src_width / src_height;
-  float target_aspect = (float)WIDTH / HEIGHT; // 9:16 = 0.5625
-
-  int scaled_width, scaled_height;
-  if (src_aspect > target_aspect) {
-    // Source is wider - fit to height and crop sides
-    scaled_height = HEIGHT;
-    scaled_width = (int)(HEIGHT * src_aspect);
-  } else {
-    // Source is taller - fit to width and crop top/bottom
-    scaled_width = WIDTH;
-    scaled_height = (int)(WIDTH / src_aspect);
+  
+  if (src_width != WIDTH || src_height != HEIGHT) {
+    printf("Warning: Video dimensions %dx%d don't match expected %dx%d\n", 
+           src_width, src_height, WIDTH, HEIGHT);
+    printf("Video should be pre-scaled to 1080x1920 for optimal performance\n");
   }
 
-  // Setup scaling context with proper dimensions
+  // Simple YUV to RGBA conversion context (no scaling)
   bg->sws_ctx = sws_getContext(src_width, src_height, bg->codec_ctx->pix_fmt,
-                               scaled_width, scaled_height, AV_PIX_FMT_RGBA,
-                               SWS_BILINEAR, NULL, NULL, NULL);
+                               WIDTH, HEIGHT, AV_PIX_FMT_RGBA,
+                               SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
   if (!bg->sws_ctx) {
-    printf("Error: Could not initialize scaling context\n");
+    printf("Error: Could not initialize color conversion context\n");
     return -1;
   }
 
@@ -407,9 +369,11 @@ int initBackgroundVideo(BackgroundVideo *bg, const char *filename) {
   return 0;
 }
 
-// Get background video frame at specific time
-int getBackgroundFrame(BackgroundVideo *bg, double target_time,
-                       uint8_t *rgba_buffer) {
+
+
+
+// Get background video frame at specific time on-demand
+int getBackgroundFrame(BackgroundVideo *bg, double target_time, uint8_t *rgba_buffer) {
   // Clear the buffer to black first
   memset(rgba_buffer, 0, WIDTH * HEIGHT * 4);
 
@@ -419,28 +383,24 @@ int getBackgroundFrame(BackgroundVideo *bg, double target_time,
     target_pts += bg->start_time;
   }
 
-  // Only seek when we have a significant time jump
-  static int64_t last_pts = -1;
-  static double last_frame_time = -1.0;
+  // Smart seeking - only seek for large jumps or backwards
+  static double last_target_time = -1.0;
+  static bool first_seek = true;
 
-  // Clear the buffer to black first
-  memset(rgba_buffer, 0, WIDTH * HEIGHT * 4);
+  bool should_seek = first_seek || 
+                     target_time < last_target_time || 
+                     (target_time - last_target_time) > 0.5;
 
-  // Calculate target PTS for seeking
-  if (bg->start_time != AV_NOPTS_VALUE) {
-    target_pts += bg->start_time;
-  }
-
-  // Seek if first time or significant jump or going backwards
-  if (last_pts == -1 || target_pts < last_pts || llabs(target_pts - last_pts) > (int64_t)(0.5 / bg->time_base)) {
+  if (should_seek) {
     int seek_flags = AVSEEK_FLAG_BACKWARD;
     if (av_seek_frame(bg->fmt_ctx, bg->stream_index, target_pts, seek_flags) >= 0) {
       avcodec_flush_buffers(bg->codec_ctx);
     }
-    last_pts = target_pts;
+    first_seek = false;
   }
+  last_target_time = target_time;
 
-  // Read frames until we find one close to our target time
+  // Decode frames until we find the target
   while (av_read_frame(bg->fmt_ctx, bg->pkt) >= 0) {
     if (bg->pkt->stream_index == bg->stream_index) {
       if (avcodec_send_packet(bg->codec_ctx, bg->pkt) >= 0) {
@@ -452,55 +412,28 @@ int getBackgroundFrame(BackgroundVideo *bg, double target_time,
 
           double frame_time = frame_pts * bg->time_base;
 
-          // Skip if frame is before last frame time (prevent jumping back)
-          if (frame_time < last_frame_time) continue;
-
-          // Use frame if it's the closest before or at target
-          if (frame_time <= target_time + 0.02) {
-            last_frame_time = frame_time;
-            // Calculate scaled dimensions
-            int src_width = bg->codec_ctx->width;
-            int src_height = bg->codec_ctx->height;
-            float src_aspect = (float)src_width / src_height;
-            float target_aspect = (float)WIDTH / HEIGHT;
-
-            int scaled_width, scaled_height;
-            if (src_aspect > target_aspect) {
-              scaled_height = HEIGHT;
-              scaled_width = (int)(HEIGHT * src_aspect);
-            } else {
-              scaled_width = WIDTH;
-              scaled_height = (int)(WIDTH / src_aspect);
-            }
-
-            // Create temporary buffer for scaled image
-            uint8_t *temp_buffer = malloc(scaled_width * scaled_height * 4);
-            if (!temp_buffer)
-              return -1;
-
-            uint8_t *temp_data[1] = {temp_buffer};
-            int temp_linesize[1] = {scaled_width * 4};
-
-            // Scale to temporary buffer
-            sws_scale(bg->sws_ctx, (const uint8_t *const *)bg->frame->data,
-                      bg->frame->linesize, 0, src_height, temp_data,
-                      temp_linesize);
-
-            // Copy centered portion to output buffer
-            int offset_x = (scaled_width - WIDTH) / 2;
-            int offset_y = (scaled_height - HEIGHT) / 2;
-
-            for (int y = 0; y < HEIGHT; y++) {
-              int src_y = y + offset_y;
-              if (src_y >= 0 && src_y < scaled_height) {
-                uint8_t *src_line =
-                    temp_buffer + (src_y * scaled_width + offset_x) * 4;
-                uint8_t *dst_line = rgba_buffer + y * WIDTH * 4;
-                memcpy(dst_line, src_line, WIDTH * 4);
+          // Use this frame if it's at or past our target time
+          if (frame_time >= target_time - 0.016) { // Within one frame at 60fps
+            // Check if this is a hardware frame that needs transfer
+            AVFrame *src_frame = bg->frame;
+            if (bg->frame->format == AV_PIX_FMT_VAAPI) {
+              int ret = av_hwframe_transfer_data(bg->sw_frame, bg->frame, 0);
+              if (ret < 0) {
+                printf("Error: Failed to transfer frame from GPU to CPU (ret=%d)\n", ret);
+                av_packet_unref(bg->pkt);
+                return -1;
               }
+              src_frame = bg->sw_frame;
             }
 
-            free(temp_buffer);
+            // Direct conversion from YUV to RGBA (video is pre-scaled to 1080x1920)
+            const uint8_t *src_data[4] = {src_frame->data[0], src_frame->data[1], src_frame->data[2], NULL};
+            int src_linesize[4] = {src_frame->linesize[0], src_frame->linesize[1], src_frame->linesize[2], 0};
+            uint8_t *dst_data[1] = {rgba_buffer};
+            int dst_linesize[1] = {WIDTH * 4};
+
+            sws_scale(bg->sws_ctx, src_data, src_linesize, 0, HEIGHT, dst_data, dst_linesize);
+
             av_packet_unref(bg->pkt);
             return 0;
           }
@@ -519,6 +452,8 @@ void cleanupBackgroundVideo(BackgroundVideo *bg) {
     sws_freeContext(bg->sws_ctx);
   if (bg->frame)
     av_frame_free(&bg->frame);
+  if (bg->sw_frame)
+    av_frame_free(&bg->sw_frame);
   if (bg->pkt)
     av_packet_free(&bg->pkt);
   if (bg->codec_ctx)
@@ -637,11 +572,22 @@ int loadAudioFiles(const char *projectId, AudioFile **audioFiles,
                     printf("Preloading audio file: %s\n",
                            entries[fileIdx]->d_name);
 
-                    // Estimate buffer size (assume ~3 second audio files)
-                    int estimated_samples =
-                        44100 * 5; // 5 seconds stereo at 44.1kHz
-                    af->stereo_buffer =
-                        malloc(estimated_samples * 2 * sizeof(float));
+                    // Calculate actual file duration and buffer size
+                    double duration = 0.0;
+                    if (af->fmt_ctx->duration != AV_NOPTS_VALUE) {
+                      duration = (double)af->fmt_ctx->duration / AV_TIME_BASE;
+                    } else if (af->audio_stream->duration != AV_NOPTS_VALUE) {
+                      duration = af->audio_stream->duration * av_q2d(af->audio_stream->time_base);
+                    } else {
+                      // Fallback: estimate from file size (rough approximation)
+                      duration = 10.0; // Default to 10 seconds if duration unknown
+                    }
+                    
+                    printf("Audio file duration: %.2f seconds\n", duration);
+                    
+                    // Allocate buffer based on actual duration + 10% safety margin
+                    int estimated_samples = (int)(44100 * duration * 1.1);
+                    af->stereo_buffer = malloc(estimated_samples * 2 * sizeof(float));
                     af->buffer_samples = 0;
 
                     if (af->stereo_buffer) {
@@ -666,19 +612,25 @@ int loadAudioFiles(const char *projectId, AudioFile **audioFiles,
                                     (const uint8_t **)af->frame->data,
                                     af->frame->nb_samples);
 
-                                if (converted > 0 &&
-                                    af->buffer_samples + converted <
-                                        estimated_samples) {
+                                if (converted > 0) {
+                                  // Check if we need to resize buffer
+                                  if (af->buffer_samples + converted >= estimated_samples) {
+                                    printf("Warning: Audio file longer than estimated, expanding buffer\n");
+                                    estimated_samples = (af->buffer_samples + converted) * 2; // Double the size
+                                    af->stereo_buffer = realloc(af->stereo_buffer, estimated_samples * 2 * sizeof(float));
+                                    if (!af->stereo_buffer) {
+                                      printf("Error: Could not expand audio buffer\n");
+                                      break;
+                                    }
+                                  }
+                                  
                                   float *left = (float *)out_data[0];
                                   float *right = (float *)out_data[1];
 
                                   // Simple interleave stereo samples
                                   for (int i = 0; i < converted; i++) {
-                                    af->stereo_buffer[(af->buffer_samples + i) *
-                                                      2] = left[i];
-                                    af->stereo_buffer[(af->buffer_samples + i) *
-                                                          2 +
-                                                      1] = right[i];
+                                    af->stereo_buffer[(af->buffer_samples + i) * 2] = left[i];
+                                    af->stereo_buffer[(af->buffer_samples + i) * 2 + 1] = right[i];
                                   }
                                   af->buffer_samples += converted;
                                 }
@@ -760,6 +712,8 @@ int main(int argc, char *argv[]) {
     // Hide window and disable VSync for maximum render speed
     SetWindowState(FLAG_WINDOW_HIDDEN);
     SetTargetFPS(0); // Unlimited FPS for fastest rendering
+    // Disable all window decorations and minimize overhead
+    SetConfigFlags(FLAG_WINDOW_UNDECORATED);
     printf("Render mode: Running headless for maximum speed\n");
   } else {
     SetTargetFPS(FPS);
@@ -871,7 +825,7 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    printf("AMD hardware acceleration initialized for render mode\n");
+    printf("Background video initialized for render mode\n");
   }
 
   // Setup output format with both video and audio
@@ -883,37 +837,51 @@ int main(int argc, char *argv[]) {
   }
 
   // Setup video codec with optimizations
-  const AVCodec *video_codec = avcodec_find_encoder_by_name("libx264");
+  const AVCodec *video_codec = avcodec_find_encoder_by_name("h264_amf");
   if (!video_codec) {
-    fprintf(stderr, "libx264 encoder not found\n");
-    return 1;
+    fprintf(stderr, "h264_amf encoder not found, falling back to libx264\n");
+    video_codec = avcodec_find_encoder_by_name("libx264");
+    if (!video_codec) {
+      fprintf(stderr, "libx264 encoder not found\n");
+      return 1;
+    }
   }
 
   video_st = avformat_new_stream(fmt_ctx, video_codec);
+  video_st->time_base = (AVRational){1, FPS};
   video_codec_ctx = avcodec_alloc_context3(video_codec);
 
-  // Configure encoder settings for maximum speed
-  video_codec_ctx->bit_rate = 6000000; // Balanced bitrate
+  // Common settings
+  video_codec_ctx->bit_rate = 8000000;
   video_codec_ctx->width = WIDTH;
   video_codec_ctx->height = HEIGHT;
-  video_codec_ctx->time_base = (AVRational){1, FPS};
+  video_codec_ctx->time_base = video_st->time_base;
   video_codec_ctx->framerate = (AVRational){FPS, 1};
-  video_codec_ctx->gop_size = 60;    // Larger GOP for better compression
-  video_codec_ctx->max_b_frames = 0; // Disable B-frames for speed
-  video_codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+  video_codec_ctx->gop_size = 60;
+  video_codec_ctx->max_b_frames = 0;
+  video_codec_ctx->pix_fmt = (strstr(video_codec->name, "amf")) ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
 
-  // Ultra-fast software encoding settings with maximum parallelization
   AVDictionary *encoder_opts = NULL;
-  av_dict_set(&encoder_opts, "preset", "ultrafast", 0); // Fastest encoding
-  av_dict_set(&encoder_opts, "tune", "zerolatency", 0); // Minimize latency
-  av_dict_set(&encoder_opts, "crf", "28", 0); // Constant rate factor for speed
-  av_dict_set(&encoder_opts, "threads", "0", 0); // Use all CPU threads
-  av_dict_set(&encoder_opts, "thread_type", "slice+frame",
-              0); // Enable both slice and frame threading
-  av_dict_set(&encoder_opts, "x264-params",
-              "aq-mode=0:me=dia:subme=1:ref=1:analyse=none:trellis=0:no-fast-"
-              "pskip=0:8x8dct=0:sliced-threads=1",
-              0);
+  // AMF specific options
+  if (strstr(video_codec->name, "amf")) {
+    av_dict_set(&encoder_opts, "usage", "lowlatency", 0);
+    av_dict_set(&encoder_opts, "profile", "main", 0);
+    av_dict_set(&encoder_opts, "quality", "speed", 0);
+    av_dict_set(&encoder_opts, "rc", "cqp", 0);
+    av_dict_set(&encoder_opts, "qp_i", "23", 0);
+    av_dict_set(&encoder_opts, "qp_p", "23", 0);
+  } else {
+    av_dict_set(&encoder_opts, "preset", "ultrafast", 0); // Fastest encoding
+    av_dict_set(&encoder_opts, "tune", "zerolatency", 0); // Minimize latency
+    av_dict_set(&encoder_opts, "crf", "28", 0); // Constant rate factor for speed
+    av_dict_set(&encoder_opts, "threads", "0", 0); // Use all CPU threads
+    av_dict_set(&encoder_opts, "thread_type", "slice+frame",
+                0); // Enable both slice and frame threading
+    av_dict_set(&encoder_opts, "x264-params",
+                "aq-mode=0:me=dia:subme=1:ref=1:analyse=none:trellis=0:no-fast-"
+                "pskip=0:8x8dct=0:sliced-threads=1",
+                0);
+  }
 
   if (avcodec_open2(video_codec_ctx, video_codec, &encoder_opts) < 0) {
     fprintf(stderr, "Could not open video codec\n");
@@ -922,7 +890,7 @@ int main(int argc, char *argv[]) {
   }
   av_dict_free(&encoder_opts);
 
-  printf("Successfully initialized optimized software H.264 encoder\n");
+  printf("Successfully initialized %s encoder\n", video_codec->name);
   avcodec_parameters_from_context(video_st->codecpar, video_codec_ctx);
 
   // Setup audio codec if we have audio files
@@ -966,15 +934,30 @@ int main(int argc, char *argv[]) {
   av_frame_get_buffer(video_frame, 0);
 
   sws_ctx = sws_getContext(WIDTH, HEIGHT, AV_PIX_FMT_RGBA, WIDTH, HEIGHT,
-                           AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+                           video_codec_ctx->pix_fmt, SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
   static int64_t audio_sample_count = 0;
-  // Audio buffer for rate matching
-  float *audio_buffer_left = malloc(2048 * sizeof(float));
-  float *audio_buffer_right = malloc(2048 * sizeof(float));
+  // Pre-allocate audio buffers for performance
+  const int audio_buffer_size = 8192; // Larger buffer to reduce allocations
+  float *audio_buffer_left = malloc(audio_buffer_size * sizeof(float));
+  float *audio_buffer_right = malloc(audio_buffer_size * sizeof(float));
+  float *temp_left = malloc(audio_buffer_size * sizeof(float));
+  float *temp_right = malloc(audio_buffer_size * sizeof(float));
   int audio_buffer_len = 0;
   int frame_idx = 0;
+  
+  // Pre-allocate RGBA buffer for direct rendering
+  uint8_t *rgba_frame_buffer = malloc(WIDTH * HEIGHT * 4);
+  if (!rgba_frame_buffer) {
+    printf("Error: Could not allocate frame buffer\n");
+    return 1;
+  }
+  
+  double progress_start_time = GetTime();
+  double total_bg_time = 0, total_render_time = 0, total_encode_time = 0;
+  
   while (!WindowShouldClose() && frame_idx < FRAME_COUNT) {
+    TIMING_START(total_frame);
     float deltaTime;
     if (renderMode) {
       // Use fixed time step for consistent 60fps output video
@@ -1078,28 +1061,27 @@ int main(int argc, char *argv[]) {
     BeginDrawing();
 
     if (renderMode && backgroundBuffer) {
+      TIMING_START(background_frame);
       // Get background video frame
       if (getBackgroundFrame(&bgVideo, currentTime, backgroundBuffer) == 0) {
-        // Create background image without loading as texture (more efficient)
-        Image bgImage = {.data = backgroundBuffer,
-                         .width = WIDTH,
-                         .height = HEIGHT,
-                         .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
-                         .mipmaps = 1};
-
-        // Reuse texture instead of creating new one each frame
-        if (bgTexture.id != 0) {
-          UpdateTexture(bgTexture, backgroundBuffer);
-        } else {
+        // Initialize texture once, then just update data
+        if (bgTexture.id == 0) {
+          Image bgImage = {.data = backgroundBuffer,
+                           .width = WIDTH,
+                           .height = HEIGHT,
+                           .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+                           .mipmaps = 1};
           bgTexture = LoadTextureFromImage(bgImage);
+        } else {
+          // Much faster than recreating texture
+          UpdateTexture(bgTexture, backgroundBuffer);
         }
         DrawTexture(bgTexture, 0, 0, WHITE);
+        total_bg_time += get_time_ms() - timing_start_background_frame;
       } else {
-        // Fallback to dark background
         ClearBackground(DARKBLUE);
       }
     } else if (renderMode) {
-      // Use dark background for render mode (placeholder for background video)
       ClearBackground(DARKBLUE);
     } else {
       ClearBackground(RAYWHITE);
@@ -1244,35 +1226,46 @@ int main(int argc, char *argv[]) {
     }
 
     EndDrawing();
-
-    // Capture frame
-    Image screen = LoadImageFromScreen();
-    uint8_t *rgba_data = (uint8_t *)screen.data;
-
-    // Convert RGBA to YUV
-    const uint8_t *in_data[1] = {rgba_data};
-    int in_linesize[1] = {4 * WIDTH};
-    sws_scale(sws_ctx, in_data, in_linesize, 0, HEIGHT, video_frame->data,
-              video_frame->linesize);
-
-    video_frame->pts = frame_idx;
-    AVPacket *pkt = av_packet_alloc();
-    if (avcodec_send_frame(video_codec_ctx, video_frame) >= 0) {
-      while (avcodec_receive_packet(video_codec_ctx, pkt) >= 0) {
-        av_packet_rescale_ts(pkt, video_codec_ctx->time_base,
-                             video_st->time_base);
-        pkt->stream_index = video_st->index;
-        av_interleaved_write_frame(fmt_ctx, pkt);
-        av_packet_unref(pkt);
+    
+    // Only capture frame in render mode for performance
+    if (renderMode) {
+      TIMING_START(encode_frame);
+      // Direct OpenGL pixel read - much faster than LoadImageFromScreen()
+      unsigned char *pixels = rlReadScreenPixels(WIDTH, HEIGHT);
+      if (pixels) {
+        memcpy(rgba_frame_buffer, pixels, WIDTH * HEIGHT * 4);
+        RL_FREE(pixels);  // Free the pixel data returned by rlReadScreenPixels
       }
+      
+      // Convert RGBA to YUV using pre-allocated buffer
+      const uint8_t *in_data[1] = {rgba_frame_buffer};
+      int in_linesize[1] = {4 * WIDTH};
+      sws_scale(sws_ctx, in_data, in_linesize, 0, HEIGHT, video_frame->data,
+                video_frame->linesize);
+
+      video_frame->pts = frame_idx;
+      AVPacket *pkt = av_packet_alloc();
+      if (avcodec_send_frame(video_codec_ctx, video_frame) >= 0) {
+        while (avcodec_receive_packet(video_codec_ctx, pkt) >= 0) {
+          av_packet_rescale_ts(pkt, video_codec_ctx->time_base,
+                               video_st->time_base);
+          pkt->stream_index = video_st->index;
+          av_interleaved_write_frame(fmt_ctx, pkt);
+          av_packet_unref(pkt);
+        }
+      }
+      av_packet_free(&pkt);
+      total_encode_time += get_time_ms() - timing_start_encode_frame;
     }
 
     // Generate audio samples for this frame if audio codec is available
     if (audio_codec_ctx && renderMode) {
       int frame_size = audio_codec_ctx->frame_size;
       int samples_this_frame = (int)(deltaTime * 44100 + 0.5f);
-      float *temp_left = calloc(samples_this_frame, sizeof(float));
-      float *temp_right = calloc(samples_this_frame, sizeof(float));
+      
+      // Clear pre-allocated buffers instead of allocating new ones
+      memset(temp_left, 0, samples_this_frame * sizeof(float));
+      memset(temp_right, 0, samples_this_frame * sizeof(float));
       for (int i = 0; i < captionCount && i < audioFileCount; i++) {
         if (currentTime >= captions[i].startTime &&
             currentTime <= captions[i].endTime) {
@@ -1295,13 +1288,14 @@ int main(int argc, char *argv[]) {
           break;
         }
       }
-      memcpy(audio_buffer_left + audio_buffer_len, temp_left,
-             samples_this_frame * sizeof(float));
-      memcpy(audio_buffer_right + audio_buffer_len, temp_right,
-             samples_this_frame * sizeof(float));
-      audio_buffer_len += samples_this_frame;
-      free(temp_left);
-      free(temp_right);
+      // Check buffer bounds before copying
+      if (audio_buffer_len + samples_this_frame < audio_buffer_size) {
+        memcpy(audio_buffer_left + audio_buffer_len, temp_left,
+               samples_this_frame * sizeof(float));
+        memcpy(audio_buffer_right + audio_buffer_len, temp_right,
+               samples_this_frame * sizeof(float));
+        audio_buffer_len += samples_this_frame;
+      }
       while (audio_buffer_len >= frame_size) {
         audio_frame = av_frame_alloc();
         audio_frame->format = AV_SAMPLE_FMT_FLTP;
@@ -1316,13 +1310,15 @@ int main(int argc, char *argv[]) {
         audio_frame->pts = audio_sample_count;
         audio_sample_count += frame_size;
         if (avcodec_send_frame(audio_codec_ctx, audio_frame) >= 0) {
-          while (avcodec_receive_packet(audio_codec_ctx, pkt) >= 0) {
-            av_packet_rescale_ts(pkt, audio_codec_ctx->time_base,
+          AVPacket *audio_pkt = av_packet_alloc();
+          while (avcodec_receive_packet(audio_codec_ctx, audio_pkt) >= 0) {
+            av_packet_rescale_ts(audio_pkt, audio_codec_ctx->time_base,
                                  audio_st->time_base);
-            pkt->stream_index = audio_st->index;
-            av_interleaved_write_frame(fmt_ctx, pkt);
-            av_packet_unref(pkt);
+            audio_pkt->stream_index = audio_st->index;
+            av_interleaved_write_frame(fmt_ctx, audio_pkt);
+            av_packet_unref(audio_pkt);
           }
+          av_packet_free(&audio_pkt);
         }
         av_frame_free(&audio_frame);
         memmove(audio_buffer_left, audio_buffer_left + frame_size,
@@ -1333,27 +1329,41 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    av_packet_free(&pkt);
-
-    UnloadImage(screen);
+    double frame_total_time = get_time_ms() - timing_start_total_frame;
+    total_render_time += frame_total_time - (renderMode ? (total_bg_time + total_encode_time) : 0);
+    
     frame_idx++;
 
-    // Progress reporting for render mode
-    if (renderMode && frame_idx % 60 == 0) { // Every second
+    // Progress reporting for render mode (less frequent for better performance)
+    if (renderMode && frame_idx % 600 == 0 && frame_idx > 0) { // Every 10 seconds
+      double current_time = GetTime();
+      double time_elapsed = current_time - progress_start_time;
+      float avg_fps = 600.0f / time_elapsed;
+      progress_start_time = current_time;
       float progress = (float)frame_idx / FRAME_COUNT * 100.0f;
-      printf("Progress: %.1f%% (%d/%d frames) - %.1f fps\n", progress,
-             frame_idx, FRAME_COUNT, 60.0f / GetFrameTime());
+      
+      double avg_bg = total_bg_time / frame_idx;
+      double avg_render = total_render_time / frame_idx;
+      double avg_encode = total_encode_time / frame_idx;
+      double avg_total = frame_total_time;
+      
+      printf("Progress: %.1f%% (%d/%d frames) - %.1f fps\n", progress, frame_idx, FRAME_COUNT, avg_fps);
+      printf("  Timing - BG: %.2fms, Render: %.2fms, Encode: %.2fms, Total: %.2fms\n",
+             avg_bg, avg_render, avg_encode, avg_total);
     }
   }
 
   // Flush video encoder
-  avcodec_send_frame(video_codec_ctx, NULL);
-  AVPacket *pkt = av_packet_alloc();
-  while (avcodec_receive_packet(video_codec_ctx, pkt) >= 0) {
-    av_packet_rescale_ts(pkt, video_codec_ctx->time_base, video_st->time_base);
-    pkt->stream_index = video_st->index;
-    av_interleaved_write_frame(fmt_ctx, pkt);
-    av_packet_unref(pkt);
+  if (renderMode) {
+    avcodec_send_frame(video_codec_ctx, NULL);
+    AVPacket *pkt = av_packet_alloc();
+    while (avcodec_receive_packet(video_codec_ctx, pkt) >= 0) {
+      av_packet_rescale_ts(pkt, video_codec_ctx->time_base, video_st->time_base);
+      pkt->stream_index = video_st->index;
+      av_interleaved_write_frame(fmt_ctx, pkt);
+      av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
   }
 
   if (audio_codec_ctx && audio_buffer_len > 0) {
@@ -1373,22 +1383,36 @@ int main(int argc, char *argv[]) {
     audio_frame->pts = audio_sample_count;
     audio_sample_count += frame_size;
     if (avcodec_send_frame(audio_codec_ctx, audio_frame) >= 0) {
-      while (avcodec_receive_packet(audio_codec_ctx, pkt) >= 0) {
-        av_packet_rescale_ts(pkt, audio_codec_ctx->time_base,
+      AVPacket *final_audio_pkt = av_packet_alloc();
+      while (avcodec_receive_packet(audio_codec_ctx, final_audio_pkt) >= 0) {
+        av_packet_rescale_ts(final_audio_pkt, audio_codec_ctx->time_base,
                              audio_st->time_base);
-        pkt->stream_index = audio_st->index;
-        av_interleaved_write_frame(fmt_ctx, pkt);
-        av_packet_unref(pkt);
+        final_audio_pkt->stream_index = audio_st->index;
+        av_interleaved_write_frame(fmt_ctx, final_audio_pkt);
+        av_packet_unref(final_audio_pkt);
       }
+      av_packet_free(&final_audio_pkt);
     }
     av_frame_free(&audio_frame);
   }
-  av_packet_free(&pkt);
+  // Packet cleanup moved to individual scopes
 
   av_write_trailer(fmt_ctx);
   avio_closep(&fmt_ctx->pb);
 
-  // Cleanup
+  // Cleanup pre-allocated buffers
+  if (rgba_frame_buffer)
+    free(rgba_frame_buffer);
+  if (audio_buffer_left)
+    free(audio_buffer_left);
+  if (audio_buffer_right)
+    free(audio_buffer_right);
+  if (temp_left)
+    free(temp_left);
+  if (temp_right)
+    free(temp_right);
+  
+  // Cleanup FFmpeg resources
   if (video_codec_ctx)
     avcodec_free_context(&video_codec_ctx);
   if (audio_codec_ctx)
@@ -1398,7 +1422,8 @@ int main(int argc, char *argv[]) {
     av_frame_free(&video_frame);
   if (audio_frame)
     av_frame_free(&audio_frame);
-  sws_freeContext(sws_ctx);
+  if (sws_ctx)
+    sws_freeContext(sws_ctx);
 
   // Cleanup background video and audio
   if (renderMode) {
@@ -1407,10 +1432,7 @@ int main(int argc, char *argv[]) {
     cleanupBackgroundVideo(&bgVideo);
     if (backgroundBuffer)
       free(backgroundBuffer);
-    if (audio_codec_ctx) {
-      free(audio_buffer_left);
-      free(audio_buffer_right);
-    }
+    // Audio buffers are now freed in main cleanup
     for (int i = 0; i < audioFileCount; i++) {
       if (audioFiles[i].stereo_buffer)
         free(audioFiles[i].stereo_buffer);
